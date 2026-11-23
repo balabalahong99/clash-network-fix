@@ -88,6 +88,19 @@ if ($expireLine) {
 # 本机基础网络检查（直连百度，不走代理）
 $wc = New-Object System.Net.WebClient; $wc.Proxy = $null; $wc.Headers.Add('User-Agent','Mozilla/5.0')
 try { $s = $wc.DownloadString('https://www.baidu.com'); "DIRECT_BAIDU=OK" } catch { "DIRECT_BAIDU=FAIL" }
+
+# ChatGPT 进程数（正常 5-8 个；>10 说明僵尸进程堆积，是之前强杀残留的）
+$gptProcs = Get-Process ChatGPT -ErrorAction SilentlyContinue
+"CHATGPT_PROCS=$(@($gptProcs).Count)"
+if (@($gptProcs).Count -gt 8) {
+    "  ⚠️ 僵尸进程堆积！最早启动=$((@($gptProcs | Sort-Object StartTime)[0].StartTime.ToString('HH:mm:ss')))"
+}
+
+# Clash 活动连接概览
+$conns = (Invoke-Clash 'GET' '/connections' | ConvertFrom-Json).connections
+"TOTAL_CONNS=$($conns.Count)"
+$conns | Where-Object { -not $_.closed } | Group-Object { $_.metadata.host -replace '\d+','N' } | Sort-Object Count -Descending |
+    Select-Object -First 8 | ForEach-Object { "  $($_.Name) x$($_.Count)" }
 ```
 
 ## 第二步: 判断根因
@@ -99,6 +112,8 @@ try { $s = $wc.DownloadString('https://www.baidu.com'); "DIRECT_BAIDU=OK" } catc
 | **ChatGPT 200 但 GitHub/Google 同时超时** | `NCloud` 分组选中的固定节点已死 | NCloud 切 `自动选择`，别固定节点名 |
 | **OpenAI 分组 now 是香港节点** | 故障转移组按 gstatic 检测，香港能通但 ChatGPT 不认港区 | OpenAI 手动固定日本/新加坡/美国节点，禁用故障转移 |
 | 网络栈测试 200 但应用反复重连 | 应用进程里的旧连接卡住 | 清旧连接 + 重启应用 |
+| **HTTP HEAD 连测全 200 但 git ls-remote 超时 / ChatGPT 只转圈不回答** | **僵尸进程堆积 + 旧代理连接积压**（HEAD 被 fake-ip 骗过，实际 TLS 连接被挤） | 杀僵尸进程 + 清连接 + 重启应用 |
+| **CHATGPT_PROCS > 8** | 之前强杀 ChatGPT 留下的僵尸进程 | 场景 C 处理（杀进程 + 清连接 + 重启） |
 | **所有域名 FAIL + 测速只剩 DIRECT 或全超时 + 订阅已过期** | **订阅到期，节点鉴权全失效**（TCP 通但代理握手失败） | 续费订阅 → Clash Verge 更新订阅 → 节点恢复后再按场景切分组 |
 | 所有域名 FAIL + 测速剩少数节点 + 订阅未过期 | 整批节点失效（机场质量波动） | 测速挑存活节点 + 切自动选择 |
 
@@ -138,27 +153,45 @@ Invoke-Clash 'PUT' '/proxies/NCloud' '{"name":"自动选择"}'
 **固化**: 更新 `profiles.yaml` 中 `type: remote` 那段 `selected:` 块里的 `now:` 值。
 注意该文件会被订阅更新/Clash UI 操作重写，`selected` 里的 OpenAI 条目可能整个消失，发现没了就补回。
 
-### 场景 C — 应用旧连接卡住
+### 场景 C — 僵尸进程 + 旧连接堆积（最常见的"代理好但应用坏"）
 
-应用（ChatGPT、Git）的进程会缓存失效的代理连接，即使节点修好也继续重连。**必须清理**:
+这是最容易被忽略的场景：**HTTP HEAD 连测全 200，但 git ls-remote 超时、ChatGPT 只转圈不回答**。HEAD 请求被 fake-ip 应答骗过了，但实际 TLS 长连接被积压的僵尸进程和旧代理连接挤死了。
+
+**判定线索**：
+- `CHATGPT_PROCS > 8`（正常应 5-8 个）
+- 活动连接里 `closed=false` 的 OpenAI/GitHub 连接数明显偏多
+- HTTP HEAD 全 200，但 `.NET Invoke-WebRequest -Proxy` 走真实代理端口时超时或很慢
+
+**修复（严格按顺序，每步必须做）**：
 
 ```powershell
-# ChatGPT 相关域名
+# 1. 先清旧连接（所有 ChatGPT + GitHub 相关，带 closed 也清，防止残留）
 $conns = (Invoke-Clash 'GET' '/connections' | ConvertFrom-Json).connections |
-    Where-Object { $_.metadata.host -match 'chatgpt|openai|oaistatic|oaiusercontent' }
+    Where-Object { $_.metadata.host -match 'chatgpt|openai|oaistatic|oaiusercontent|github|githubusercontent' }
+foreach ($c in $conns) { Invoke-Clash 'DELETE' "/connections/$($c.id)" }
+"清连接=$($conns.Count)"
 
-# GitHub 相关域名
-$conns = (Invoke-Clash 'GET' '/connections' | ConvertFrom-Json).connections |
-    Where-Object { $_.metadata.host -match 'github|githubusercontent' }
+# 2. 杀 ChatGPT 进程（全部，不管僵尸还是正常，彻底清干净）
+$procs = Get-Process ChatGPT -ErrorAction SilentlyContinue
+"杀进程=$(@($procs).Count)"
+$procs | Stop-Process -Force -ErrorAction SilentlyContinue
 
-foreach ($c in $conns) {
-    Invoke-Clash 'DELETE' "/connections/$($c.id)"
-}
+# 3. 等待完全退出再重启（至少 4 秒，让 Clash 释放所有被占的端口）
+Start-Sleep -Seconds 4
 
-# 重启 ChatGPT（UWP 应用用 shell:AppsFolder）
-Stop-Process -Name ChatGPT -Force -ErrorAction SilentlyContinue
+# 4. 重启 ChatGPT（UWP 应用用 shell:AppsFolder）
 Start-Process 'shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App'
+Start-Sleep -Seconds 10   # 等进程起来再看
+
+# 5. 验证进程数回到正常范围
+$newProcs = @(Get-Process ChatGPT -ErrorAction SilentlyContinue)
+"重启后进程=$($newProcs.Count)  (正常 5-8)"
 ```
+
+**关键教训**：
+- 不要只清连接就重启——僵尸进程还在的话，又会快速产生新的坏连接
+- 不要只重启不清连接——旧连接不会自动释放，新进程还是会走到同一批死连接上
+- 旧连接和僵尸进程必须**一起清**，顺序是：清连接 → 杀进程 → 等 → 重启 → 验证
 
 ### 场景 D — 订阅过期（所有节点全挂）
 
@@ -185,7 +218,9 @@ $expire = [int64]$expireLine.Matches[0].Groups[1].Value
 ## 第四步: 验证
 
 ```powershell
-# HTTP 连测 3 轮，目标域名全部 200 才算好
+# HTTP HEAD 连测 3 轮，目标域名全部 200 才算好
+# ⚠️ 但 HTTP HEAD 全 200 不够——它会被 fake-ip 应答骗过，
+#    必须再走一次真实 TLS 长连接（git ls-remote / 应用实际调用）
 foreach ($i in 1..3) {
   $res = @()
   foreach ($u in @('https://chatgpt.com','https://github.com')) {
@@ -195,13 +230,18 @@ foreach ($i in 1..3) {
   "ROUND_$i : $($res -join '  ')"
 }
 
-# Git 实际连通验证（比 HTTP 更能证明 GitHub 恢复）
+# Git 实际连通验证（比 HTTP HEAD 更能证明 GitHub 真恢复了）
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-git ls-remote https://github.com/balabalahong99/clash-network-fix.git
+git ls-remote https://github.com/balabalahong99/clash-network-fix.git 2>&1 | Select-Object -First 3
+
+# ChatGPT 进程数恢复正常范围
+$finalProcs = @(Get-Process ChatGPT -ErrorAction SilentlyContinue)
+"CHATGPT_PROCS=$($finalProcs.Count)  (正常 5-8)"
+if ($finalProcs.Count -gt 8) { "  ⚠️ 僵尸进程还没清干净，再来一轮场景 C" }
 ```
 
-- 连续 2-3 次返回 200 + `git ls-remote` 成功即算修好
-- 只测 chatgpt.com 不够：不同域名走不同分组，必须按用户报障的应用分别验证
+- 连续 2-3 次返回 200 + `git ls-remote` 成功 + ChatGPT 进程数回到 5-8 = 完全修好
+- **只测 HTTP HEAD 不够**：fake-ip 会把 HEAD 请求本地应答掉，但实际走代理的 TLS 连接还没好
 
 ## 关键文件路径速查
 
@@ -223,3 +263,6 @@ git ls-remote https://github.com/balabalahong99/clash-network-fix.git
 - 这个订阅的节点质量周期性波动，成批失效是常态
 - **所有节点测速只剩 DIRECT 或全超时**时，第一反应是查订阅到期时间（`profiles.yaml` 里 `expire` 字段），不要浪费时间反复切节点
 - 订阅到期的典型表现：节点服务器 TCP 可连（`Test-NetConnection` 通），但走代理的 HTTPS 全部 TLS 握手失败或"连接被关闭"，本机直连百度正常
+- **僵尸进程是 ChatGPT 桌面版的固有问题**：多次强杀 / 重启会残留子进程，正常状态应 5-8 个，超过 10 个必须清；**只清连接不清进程** → 僵尸进程又产生新坏连接，**只重启不清连接** → 新进程继续走同一批死连接，两者必须一起清
+- **HTTP HEAD 全 200 不等于代理真的通**：fake-ip 会把 HEAD 请求在本地应答掉，走真实 TLS 长连接的 git / curl / 应用 API 才是金标准；修完必须用 `git ls-remote` 或应用实际调用验证
+- Clash Verge 的 fake-ip 模式下，**HEAD 请求和实际请求走的路径可能不同**——HEAD 被本地 fake-ip 应答绕过了代理，实际请求才真正走节点，所以 HEAD 全绿不代表代理没问题
