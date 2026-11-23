@@ -68,12 +68,26 @@ foreach ($u in @('https://chatgpt.com','https://github.com','https://www.google.
         "$u => $($r.StatusCode)" } catch { "$u => FAIL" }
 }
 
-# 批量测速（注意：返回结果只含存活节点，选中节点不在列表里 = 已死）
+# 批量测速（注意：返回结果只含存活节点，选中节点不在列表里 = 已死；只有 DIRECT 活着 = 订阅可能过期）
 $url = [uri]::EscapeDataString('https://github.com')
 $delay = Invoke-Clash 'GET' "/group/NCloud/delay?url=$url&timeout=5000" | ConvertFrom-Json
 $delay.PSObject.Properties | Where-Object { $_.Value -is [int] -and $_.Value -gt 0 } |
     ForEach-Object { [pscustomobject]@{ Node = $_.Name; Delay = $_.Value } } |
     Sort-Object Delay | Select-Object -First 10
+
+# 订阅到期时间（从 profiles.yaml 里读，是 Unix 时间戳）
+$profPath = "C:\Users\Administrator\AppData\Roaming\io.github.clash-verge-rev.clash-verge-rev\profiles.yaml"
+$expireLine = Select-String -Path $profPath -Pattern '^\s+expire:\s*(\d+)' | Select-Object -First 1
+if ($expireLine) {
+    $expire = [int64]$expireLine.Matches[0].Groups[1].Value
+    $expireDt = [DateTimeOffset]::FromUnixTimeSeconds($expire).ToLocalTime()
+    $daysLeft = [math]::Round(($expireDt - [DateTimeOffset]::Now).TotalDays, 1)
+    "SUB_EXPIRE=$($expireDt.ToString('yyyy-MM-dd HH:mm'))  剩余${daysLeft}天"
+}
+
+# 本机基础网络检查（直连百度，不走代理）
+$wc = New-Object System.Net.WebClient; $wc.Proxy = $null; $wc.Headers.Add('User-Agent','Mozilla/5.0')
+try { $s = $wc.DownloadString('https://www.baidu.com'); "DIRECT_BAIDU=OK" } catch { "DIRECT_BAIDU=FAIL" }
 ```
 
 ## 第二步: 判断根因
@@ -85,9 +99,12 @@ $delay.PSObject.Properties | Where-Object { $_.Value -is [int] -and $_.Value -gt
 | **ChatGPT 200 但 GitHub/Google 同时超时** | `NCloud` 分组选中的固定节点已死 | NCloud 切 `自动选择`，别固定节点名 |
 | **OpenAI 分组 now 是香港节点** | 故障转移组按 gstatic 检测，香港能通但 ChatGPT 不认港区 | OpenAI 手动固定日本/新加坡/美国节点，禁用故障转移 |
 | 网络栈测试 200 但应用反复重连 | 应用进程里的旧连接卡住 | 清旧连接 + 重启应用 |
-| 所有域名全 FAIL 且 delay 全部超时 | 整批节点失效 | 测速挑存活节点 + 切自动选择 |
+| **所有域名 FAIL + 测速只剩 DIRECT 或全超时 + 订阅已过期** | **订阅到期，节点鉴权全失效**（TCP 通但代理握手失败） | 续费订阅 → Clash Verge 更新订阅 → 节点恢复后再按场景切分组 |
+| 所有域名 FAIL + 测速剩少数节点 + 订阅未过期 | 整批节点失效（机场质量波动） | 测速挑存活节点 + 切自动选择 |
 
-> 识别死节点：测速返回结果**只包含存活节点**，所以 `DEAD=0` 不代表全活；如果当前选中的节点名**不在返回列表里**，就是已死。
+> 识别死节点：测速返回结果**只包含存活节点**，所以 `ALIVE=0` 或只剩 `DIRECT` 时首先查订阅到期；如果订阅还有效，再判断是节点批量失效。
+
+> 订阅过期的典型表现：节点服务器 TCP 可连（如 `hkgtv.hkdsync.com:443`），但走代理的 HTTPS 请求全部报"连接被关闭"或 TLS 握手失败，本机直连百度正常。
 
 ## 第三步: 修复
 
@@ -143,6 +160,28 @@ Stop-Process -Name ChatGPT -Force -ErrorAction SilentlyContinue
 Start-Process 'shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App'
 ```
 
+### 场景 D — 订阅过期（所有节点全挂）
+
+**关键判定**：`SUB_EXPIRE` 日期在今天之前，且测速只有 DIRECT 活着或全超时，直连百度正常。
+
+**注意**：这种情况**不是代理配置问题**，不要反复切节点、改 rule 或重启应用——没用的。节点服务器 TCP 虽然能通，但机场已经不再给你鉴权了。
+
+```powershell
+# 1. 先确认订阅确实过期
+$profPath = "C:\Users\Administrator\AppData\Roaming\io.github.clash-verge-rev.clash-verge-rev\profiles.yaml"
+$expireLine = Select-String -Path $profPath -Pattern '^\s+expire:\s*(\d+)' | Select-Object -First 1
+$expire = [int64]$expireLine.Matches[0].Groups[1].Value
+"SUB_EXPIRE: $( [DateTimeOffset]::FromUnixTimeSeconds($expire).ToLocalTime() )   NOW: $(Get-Date)"
+
+# 2. 关闭 Clash Verge，等用户续费完后再开（或者 Clash Verge 界面点"更新订阅"）
+#    如果 TUN 开着先关掉，否则国内网站也被 TUN 接管
+```
+
+**续费后**：
+1. Clash Verge → 订阅 → 手动更新订阅（或等自动更新，1440 分钟一次）
+2. 更新完节点列表刷新，重新跑第一步诊断
+3. 按实际情况再切 OpenAI / NCloud 分组
+
 ## 第四步: 验证
 
 ```powershell
@@ -182,3 +221,5 @@ git ls-remote https://github.com/balabalahong99/clash-network-fix.git
 - `profiles.yaml` 会被订阅更新重写，固化后的 `now:` 需要复查
 - 切换分组的 PUT 返回 204 只代表请求被接受，**必须回读 `/proxies/<组名>` 的 `now` 确认真的生效**
 - 这个订阅的节点质量周期性波动，成批失效是常态
+- **所有节点测速只剩 DIRECT 或全超时**时，第一反应是查订阅到期时间（`profiles.yaml` 里 `expire` 字段），不要浪费时间反复切节点
+- 订阅到期的典型表现：节点服务器 TCP 可连（`Test-NetConnection` 通），但走代理的 HTTPS 全部 TLS 握手失败或"连接被关闭"，本机直连百度正常
